@@ -3,6 +3,7 @@ import logging
 import os
 import aiohttp
 import yt_dlp
+from aiohttp import web
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import Message, FSInputFile, InputMediaPhoto, InputMediaVideo
 from aiogram.filters import CommandStart
@@ -21,13 +22,10 @@ dp = Dispatcher()
 # --- ЛОГИКА ДЛЯ TIKTOK ---
 def download_tiktok_locally(url: str) -> str:
     current_dir = os.path.dirname(os.path.abspath(__file__))
-    ffmpeg_path = os.path.join(current_dir, "ffmpeg.exe")
     download_path = os.path.join(current_dir, "downloads", "%(id)s.%(ext)s")
 
     ydl_opts = {
-        # Принудительно качаем формат, где звук и видео уже склеены платформой
         'format': 'best', 
-        'ffmpeg_location': ffmpeg_path,
         'outtmpl': download_path,
         'quiet': True, 
         'no_warnings': True,
@@ -108,7 +106,7 @@ async def cmd_start(message: Message):
 
 @dp.message(F.text.contains("tiktok.com"))
 async def handle_tiktok(message: Message):
-    status_msg = await message.answer("⏳ Скачиваю TikTok (со звуком)...")
+    status_msg = await message.answer("⏳ Скачиваю TikTok...")
     loop = asyncio.get_event_loop()
     file_path = await loop.run_in_executor(None, download_tiktok_locally, message.text.strip())
 
@@ -139,7 +137,6 @@ async def handle_instagram(message: Message):
 
     await status_msg.edit_text(f"⬇️ Найдено файлов: {len(media_links)}. Скачиваю на сервер...")
 
-    # Шаг 1: Скачиваем все файлы локально
     downloaded_files = []
     for media_type, media_url in media_links:
         ext = "mp4" if media_type == "video" else "jpg"
@@ -153,12 +150,10 @@ async def handle_instagram(message: Message):
 
     await status_msg.edit_text("🚀 Формирую альбомы и отправляю в чат...")
 
-    # Шаг 2: Разбиваем файлы на пачки по 10 штук
     chunk_size = 10
     for i in range(0, len(downloaded_files), chunk_size):
         chunk = downloaded_files[i:i + chunk_size]
         
-        # Если в пачке только 1 файл (или пост состоит из 1 фото)
         if len(chunk) == 1:
             m_type, f_path = chunk[0]
             try:
@@ -168,8 +163,6 @@ async def handle_instagram(message: Message):
                     await message.reply_photo(photo=FSInputFile(f_path))
             except Exception as e:
                 logging.error(f"Ошибка отправки одиночного файла: {e}")
-        
-        # Если файлов несколько, собираем их в Media Group (альбом)
         else:
             media_group = []
             for m_type, f_path in chunk:
@@ -182,7 +175,6 @@ async def handle_instagram(message: Message):
             except Exception as e:
                 logging.error(f"Ошибка отправки альбома: {e}")
 
-    # Шаг 3: Удаляем все временные файлы с сервера
     for _, f_path in downloaded_files:
         try:
             os.remove(f_path)
@@ -191,13 +183,35 @@ async def handle_instagram(message: Message):
             
     await status_msg.delete()
 
+# --- ЗАГЛУШКА ДЛЯ RENDER ---
+async def handle_ping(request):
+    return web.Response(text="Bot is running!")
+
 async def main():
     current_dir = os.path.dirname(os.path.abspath(__file__))
     downloads_dir = os.path.join(current_dir, "downloads")
     os.makedirs(downloads_dir, exist_ok=True)
     
     await bot.delete_webhook(drop_pending_updates=True)
-    await dp.start_polling(bot)
+    
+    # Запускаем поллинг бота в фоне
+    asyncio.create_task(dp.start_polling(bot))
+    
+    # Поднимаем фейковый веб-сервер
+    app = web.Application()
+    app.router.add_get('/', handle_ping)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, '0.0.0.0', port)
+    await site.start()
+    
+    logging.info(f"Сервер-заглушка запущен на порту {port}")
+    
+    # Бесконечный цикл, чтобы скрипт не завершался
+    while True:
+        await asyncio.sleep(3600)
 
 if __name__ == "__main__":
     asyncio.run(main())
