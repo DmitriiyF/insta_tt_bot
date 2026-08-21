@@ -90,16 +90,12 @@ async def process_delete(callback: types.CallbackQuery):
     target_date = callback.data.replace("del_", "") # Дістаємо дату з кнопки
     try:
         sheet = get_sheet()
-        rows = sheet.get_all_values() # Беремо сирі дані, щоб знати точні номери рядків
         
-        row_to_delete = None
-        for i, row in enumerate(rows):
-            if row and row[0] == target_date:
-                row_to_delete = i + 1 # gspread рахує рядки з 1 (А1)
-                break
-                
-        if row_to_delete:
-            sheet.delete_row(row_to_delete)
+        # Використовуємо вбудований метод пошуку gspread (працює миттєво)
+        cell = sheet.find(target_date)
+        
+        if cell:
+            sheet.delete_row(cell.row)
             # Оновлюємо текст повідомлення, щоб кнопку більше не можна було натиснути
             await callback.message.edit_text(f"🗑 <i>Цей запис було видалено.</i>", parse_mode="HTML")
             await callback.answer("Успішно видалено!", show_alert=False)
@@ -107,8 +103,8 @@ async def process_delete(callback: types.CallbackQuery):
             await callback.answer("Запис не знайдено. Можливо, він вже видалений.", show_alert=True)
             
     except Exception as e:
-        logging.error(e)
-        await callback.answer("❌ Помилка видалення.", show_alert=True)
+        logging.error(f"Помилка видалення: {e}")
+        await callback.answer("❌ Помилка видалення. Перевір логи Vercel.", show_alert=True)
 
 # --- БЛОК ГЕНЕРАЦІЇ ЗВІТУ (З НОВИМ ЖИВИМ ПРОМПТОМ) ---
 @dp.message(Command("report"))
