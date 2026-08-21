@@ -15,7 +15,7 @@ logging.basicConfig(level=logging.INFO)
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") # Твій ключ від Google AI Studio
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -81,8 +81,18 @@ async def generate_report(message: types.Message):
         Формат має починатися словами "По цьому тижню" і далі йти блоками по іменам. Без зайвих вступів та висновків, лише сам звіт.
         """
 
-        # 3. ГЕНЕРАЦІЯ
-        model = genai.GenerativeModel('gemini-pro')
+        # 3. АВТОПІДБІР МОДЕЛІ ТА ГЕНЕРАЦІЯ
+        available_models = []
+        for m in genai.list_models():
+            if 'generateContent' in m.supported_generation_methods:
+                available_models.append(m.name)
+        
+        if not available_models:
+            await status_msg.edit_text("❌ Твій API-ключ не має доступу до жодної моделі. Перевір налаштування в Google AI Studio.")
+            return
+            
+        # Бот бере першу дозволену модель зі списку самого Гугла
+        model = genai.GenerativeModel(available_models[0])
         response = await model.generate_content_async(prompt)
         final_report = response.text.strip()
             
