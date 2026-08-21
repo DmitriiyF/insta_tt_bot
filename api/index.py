@@ -52,6 +52,7 @@ async def cmd_start(message: types.Message):
         reply_markup=kb
     )
 
+# --- ОБНОВЛЕННЫЙ СПИСОК С ТОЧНЫМИ ДАННЫМИ В КНОПКЕ ---
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
     status_msg = await message.answer("⏳ Дістаю твої записи з таблиці...")
@@ -75,8 +76,12 @@ async def cmd_list(message: types.Message):
                 note_date = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
                 if note_date >= start_of_week:
                     found = True
+                    # Зберігаємо в callback_data і дату, і обрізаний текст для надійного пошуку
+                    safe_text = text[:15].replace("|", "").strip()
+                    cb_data = f"del_{date_str}|{safe_text}"
+                    
                     kb = types.InlineKeyboardMarkup(inline_keyboard=[
-                        [types.InlineKeyboardButton(text="❌ Видалити", callback_data=f"del_{date_str}")]
+                        [types.InlineKeyboardButton(text="❌ Видалити", callback_data=cb_data)]
                     ])
                     await message.answer(f"📅 <b>{date_str}</b>\n{text}", reply_markup=kb, parse_mode="HTML")
             except ValueError:
@@ -91,23 +96,37 @@ async def cmd_list(message: types.Message):
         logging.error(e)
         await status_msg.edit_text("❌ Помилка при пошуку.")
 
+# --- УЛЬТРАНАДЕЖНОЕ УДАЛЕНИЕ ПО СТРОКАМ ---
 @dp.callback_query(F.data.startswith("del_"))
 async def process_delete(callback: types.CallbackQuery):
-    target_date = callback.data.replace("del_", "")
     try:
-        sheet = get_sheet()
-        cell = sheet.find(target_date)
+        # Витягуємо дані з кнопки
+        data_payload = callback.data.replace("del_", "")
+        target_date, target_snippet = data_payload.split("|", 1)
         
-        if cell:
-            sheet.delete_row(cell.row)
-            await callback.message.edit_text(f"🗑 <i>Цей запис було видалено.</i>", parse_mode="HTML")
+        sheet = get_sheet()
+        rows = sheet.get_all_values() # Отримуємо всі рядки списком
+        
+        row_to_delete = None
+        # Шукаємо рядок, де збігається і дата, і фрагмент тексту
+        for idx, row in enumerate(rows):
+            if len(row) >= 2:
+                row_date = str(row[0]).strip()
+                row_text = str(row[1]).strip()
+                if row_date == target_date and target_snippet in row_text:
+                    row_to_delete = idx + 1 # gspread рахує з 1
+                    break
+        
+        if row_to_delete:
+            sheet.delete_row(row_to_delete)
+            await callback.message.edit_text("🗑 <i>Цей запис було видалено з таблиці.</i>", parse_mode="HTML")
             await callback.answer("Успішно видалено!")
         else:
-            await callback.answer("Запис не знайдено або вже видалений.", show_alert=True)
+            await callback.answer("❌ Запис не знайдено в таблиці (можливо, вже видалено).", show_alert=True)
             
     except Exception as e:
         logging.error(f"Помилка видалення: {e}")
-        await callback.answer("❌ Помилка видалення.", show_alert=True)
+        await callback.answer("❌ Сталася помилка при видаленні.", show_alert=True)
 
 @dp.message(Command("report"))
 async def generate_report(message: types.Message):
