@@ -82,7 +82,7 @@ async def generate_report(message: types.Message):
         """
 
         # 3. ГЕНЕРАЦІЯ
-        model = genai.GenerativeModel('gemini-1.5-flash')
+        model = genai.GenerativeModel('gemini-pro')
         response = await model.generate_content_async(prompt)
         final_report = response.text.strip()
             
