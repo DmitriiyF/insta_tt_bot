@@ -3,33 +3,39 @@ import json
 import html
 import uuid
 import logging
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
+from datetime import datetime, timedelta, timezone
 
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
 from fastapi import FastAPI, Request, HTTPException
 import gspread
-from gspread.exceptions import CellNotFound
 from google.oauth2.service_account import Credentials
 import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
+
+# --- Таймзона: якщо tzdata недоступна, не падаємо, а беремо фіксований +3 ---
+try:
+    from zoneinfo import ZoneInfo
+
+    TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Kyiv"))
+except Exception:
+    logging.warning("ZoneInfo недоступна, використовую фіксований UTC+3")
+    TZ = timezone(timedelta(hours=3))
 
 # --- Змінні оточення Vercel ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # опційно, але дуже бажано
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")
 ALLOWED_USER_IDS = {
     int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
 }
 
-TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Kyiv"))
 DATE_FMT = "%d.%m.%Y %H:%M"
 
-# Порядок колонок у таблиці: Дата | Текст | ID
+# Порядок колонок: Дата | Текст | ID
 COL_DATE, COL_TEXT, COL_ID = 1, 2, 3
 
 bot = Bot(token=BOT_TOKEN)
@@ -43,7 +49,6 @@ _sheet_cache = None
 
 
 def get_sheet():
-    """Кешуємо клієнт у межах теплого інстансу — менше зайвих авторизацій."""
     global _sheet_cache
     if _sheet_cache is None:
         scopes = [
@@ -58,25 +63,34 @@ def get_sheet():
     return _sheet_cache
 
 
-def now_local() -> datetime:
+def now_local():
     return datetime.now(TZ)
 
 
-def start_of_week() -> datetime:
+def start_of_week():
     now = now_local()
     monday = now - timedelta(days=now.weekday())
     return monday.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
-def parse_note_date(date_str: str):
-    """Парсимо дату з таблиці і робимо її timezone-aware."""
+def parse_note_date(date_str):
     try:
         return datetime.strptime(date_str.strip(), DATE_FMT).replace(tzinfo=TZ)
     except (ValueError, AttributeError):
         return None
 
 
-def delete_sheet_row(sheet, row_index: int):
+def find_cell(sheet, value, column):
+    """gspread 5.x кидає CellNotFound, 6.x повертає None. Обробляємо обидва варіанти."""
+    try:
+        return sheet.find(value, in_column=column)
+    except Exception as e:
+        if type(e).__name__ == "CellNotFound":
+            return None
+        raise
+
+
+def delete_sheet_row(sheet, row_index):
     """gspread 6.x прибрав delete_row(); лишився тільки delete_rows()."""
     if hasattr(sheet, "delete_rows"):
         sheet.delete_rows(row_index)
@@ -84,7 +98,7 @@ def delete_sheet_row(sheet, row_index: int):
         sheet.delete_row(row_index)
 
 
-def is_allowed(user_id: int) -> bool:
+def is_allowed(user_id):
     return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
 
 
@@ -112,7 +126,7 @@ async def cmd_list(message: types.Message):
     status_msg = await message.answer("⏳ Дістаю твої записи з таблиці...")
     try:
         sheet = get_sheet()
-        rows = sheet.get_all_values()[1:]  # без заголовка
+        rows = sheet.get_all_values()[1:]
         week_start = start_of_week()
 
         found = []
@@ -130,20 +144,19 @@ async def cmd_list(message: types.Message):
 
         await status_msg.delete()
 
-        # Telegram не любить, коли ллєш десятки повідомлень поспіль
         for date_str, text, note_id in found[-30:]:
-            key = note_id or date_str  # старі записи без ID шукаємо по даті
+            key = note_id or date_str
             kb = types.InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         types.InlineKeyboardButton(
-                            text="❌ Видалити", callback_data=f"del_{key}"
+                            text="❌ Видалити", callback_data="del_" + key
                         )
                     ]
                 ]
             )
             await message.answer(
-                f"📅 <b>{html.escape(date_str)}</b>\n{html.escape(text)}",
+                "📅 <b>" + html.escape(date_str) + "</b>\n" + html.escape(text),
                 reply_markup=kb,
                 parse_mode="HTML",
             )
@@ -164,16 +177,9 @@ async def process_delete(callback: types.CallbackQuery):
     try:
         sheet = get_sheet()
 
-        # Шукаємо спочатку по ID (колонка 3), потім по даті (колонка 1).
+        # Спочатку по ID (колонка 3), потім по даті (колонка 1).
         # in_column обов'язковий: інакше find() зачепить збіг усередині тексту нотатки.
-        cell = None
-        for column in (COL_ID, COL_DATE):
-            try:
-                cell = sheet.find(key, in_column=column)
-            except CellNotFound:
-                cell = None
-            if cell:
-                break
+        cell = find_cell(sheet, key, COL_ID) or find_cell(sheet, key, COL_DATE)
 
         if cell is None:
             await callback.answer(
@@ -189,7 +195,7 @@ async def process_delete(callback: types.CallbackQuery):
 
     except Exception as e:
         logging.exception("Помилка видалення")
-        await callback.answer(f"❌ Помилка: {type(e).__name__}", show_alert=True)
+        await callback.answer("❌ Помилка: " + type(e).__name__, show_alert=True)
 
 
 # --- /report ---
@@ -200,7 +206,7 @@ PREFERRED_MODELS = (
 )
 
 
-def pick_model_name() -> str | None:
+def pick_model_name():
     available = [
         m.name
         for m in genai.list_models()
@@ -271,7 +277,6 @@ async def generate_report(message: types.Message):
         response = await model.generate_content_async(prompt)
         final_report = response.text.strip()
 
-        # Ліміт Telegram — 4096 символів
         if len(final_report) <= 4000:
             await status_msg.edit_text(final_report)
         else:
@@ -281,7 +286,7 @@ async def generate_report(message: types.Message):
 
     except Exception as e:
         logging.exception("Помилка /report")
-        await status_msg.edit_text(f"❌ Помилка: {type(e).__name__}: {e}")
+        await status_msg.edit_text("❌ Помилка: " + type(e).__name__ + ": " + str(e))
 
 
 # --- Збереження нотатки ---
