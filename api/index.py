@@ -4,7 +4,6 @@ import logging
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
-from aiogram.types import ReplyKeyboardMarkup, KeyboardButton
 from fastapi import FastAPI, Request
 import gspread
 from google.oauth2.service_account import Credentials
@@ -32,27 +31,19 @@ def get_sheet():
     client = gspread.authorize(creds)
     return client.open_by_url(SPREADSHEET_URL).sheet1
 
+# Трохи оновили стартове повідомлення, щоб Юля знала про нову команду
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
-    kb = ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text="/list"), KeyboardButton(text="/report")]
-        ],
-        resize_keyboard=True,
-        input_field_placeholder="Напиши нотатку або обери дію..."
-    )
     await message.answer(
         "Привіт, найкраща булочка! 🥐\n\n"
         "Що я вмію:\n"
         "💬 Просто пиши мені нотатки — я їх збережу.\n"
         "📋 <b>/list</b> — подивитися або видалити записи за цей тиждень.\n"
-        "📊 <b>/report</b> — зібрати гарний звіт у п'ятницю.\n\n"
-        "Кнопки керування внизу екрану активні! 👇",
-        parse_mode="HTML",
-        reply_markup=kb
+        "📊 <b>/report</b> — зібрати гарний звіт у п'ятницю.",
+        parse_mode="HTML"
     )
 
-# --- ОБНОВЛЕННЫЙ СПИСОК С ТОЧНЫМИ ДАННЫМИ В КНОПКЕ ---
+# --- НОВИЙ БЛОК: КОМАНДА /list ---
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
     status_msg = await message.answer("⏳ Дістаю твої записи з таблиці...")
@@ -76,12 +67,9 @@ async def cmd_list(message: types.Message):
                 note_date = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
                 if note_date >= start_of_week:
                     found = True
-                    # Зберігаємо в callback_data і дату, і обрізаний текст для надійного пошуку
-                    safe_text = text[:15].replace("|", "").strip()
-                    cb_data = f"del_{date_str}|{safe_text}"
-                    
+                    # Робимо інлайн-кнопку видалення
                     kb = types.InlineKeyboardMarkup(inline_keyboard=[
-                        [types.InlineKeyboardButton(text="❌ Видалити", callback_data=cb_data)]
+                        [types.InlineKeyboardButton(text="❌ Видалити", callback_data=f"del_{date_str}")]
                     ])
                     await message.answer(f"📅 <b>{date_str}</b>\n{text}", reply_markup=kb, parse_mode="HTML")
             except ValueError:
@@ -90,44 +78,39 @@ async def cmd_list(message: types.Message):
         if not found:
             await status_msg.edit_text("🤷‍♀️ За цей тиждень ти ще нічого не записувала.")
         else:
-            await status_msg.delete()
+            await status_msg.delete() # Видаляємо статус-повідомлення
             
     except Exception as e:
         logging.error(e)
-        await status_msg.edit_text("❌ Помилка при пошуку.")
+        await status_msg.edit_text("❌ Помилка при пошуку. Скажи Дімі перевірити логи.")
 
-# --- УЛЬТРАНАДЕЖНОЕ УДАЛЕНИЕ ПО СТРОКАМ ---
+# --- НОВИЙ БЛОК: ОБРОБКА КНОПКИ "ВИДАЛИТИ" ---
 @dp.callback_query(F.data.startswith("del_"))
 async def process_delete(callback: types.CallbackQuery):
+    target_date = callback.data.replace("del_", "") # Дістаємо дату з кнопки
     try:
-        # Витягуємо дані з кнопки
-        data_payload = callback.data.replace("del_", "")
-        target_date, target_snippet = data_payload.split("|", 1)
-        
         sheet = get_sheet()
-        rows = sheet.get_all_values() # Отримуємо всі рядки списком
+        rows = sheet.get_all_values() # Беремо сирі дані, щоб знати точні номери рядків
         
         row_to_delete = None
-        # Шукаємо рядок, де збігається і дата, і фрагмент тексту
-        for idx, row in enumerate(rows):
-            if len(row) >= 2:
-                row_date = str(row[0]).strip()
-                row_text = str(row[1]).strip()
-                if row_date == target_date and target_snippet in row_text:
-                    row_to_delete = idx + 1 # gspread рахує з 1
-                    break
-        
+        for i, row in enumerate(rows):
+            if row and row[0] == target_date:
+                row_to_delete = i + 1 # gspread рахує рядки з 1 (А1)
+                break
+                
         if row_to_delete:
             sheet.delete_row(row_to_delete)
-            await callback.message.edit_text("🗑 <i>Цей запис було видалено з таблиці.</i>", parse_mode="HTML")
-            await callback.answer("Успішно видалено!")
+            # Оновлюємо текст повідомлення, щоб кнопку більше не можна було натиснути
+            await callback.message.edit_text(f"🗑 <i>Цей запис було видалено.</i>", parse_mode="HTML")
+            await callback.answer("Успішно видалено!", show_alert=False)
         else:
-            await callback.answer("❌ Запис не знайдено в таблиці (можливо, вже видалено).", show_alert=True)
+            await callback.answer("Запис не знайдено. Можливо, він вже видалений.", show_alert=True)
             
     except Exception as e:
-        logging.error(f"Помилка видалення: {e}")
-        await callback.answer("❌ Сталася помилка при видаленні.", show_alert=True)
+        logging.error(e)
+        await callback.answer("❌ Помилка видалення.", show_alert=True)
 
+# --- БЛОК ГЕНЕРАЦІЇ ЗВІТУ (З НОВИМ ЖИВИМ ПРОМПТОМ) ---
 @dp.message(Command("report"))
 async def generate_report(message: types.Message):
     status_msg = await message.answer("⏳ Збираю записи та віддаю нейромережі на причісування...")
@@ -170,11 +153,11 @@ async def generate_report(message: types.Message):
         Жорсткі правила форматування:
         1. Звіт має починатися рівно з фрази "По цьому тижню" (без зірочок і жирного шрифту).
         2. Далі обов'язково порожній рядок.
-        3. Інформацію групуй по іменам моделей. ЩОБ ЗВІТ ВИГЛЯДАВ ЖИВИМ І НАПИСАНИМ ЛЮДИНОЮ, постійно чергуй формати заголовків для кожної дівчини (наприклад: "Щодо Дафі", "По Аліні", просто "Марта", "Катя" і так далі).
+        3. Інформацію групуй по іменам моделей. ЩОБ ЗВІТ ВИГЛЯДАВ ЖИВИМ І НАПИСАНИМ ЛЮДИНОЮ, постійно чергуй формати заголовків для кожної дівчини. Наприклад, для однієї напиши "Щодо Дафі", для іншої "По Аліні", для третьої просто "Марта", для четвертої "Катя" і так далі. Не роби всі заголовки за одним шаблоном!
         4. Кожен пункт під ім'ям моделі пиши з нового рядка, з великої літери. Ніяких дефісів, крапок чи маркерів списку на початку рядка (просто чистий текст).
         5. Між блоками різних моделей обов'язково роби один порожній рядок (відступ) для візуальної краси.
-        6. Пиши у діловому, але легкому, живому стилі. Не вигадуй нових фактів, використовуй ЛИШЕ те, що є в нотатках.
-        7. Не додавай ніяких вступів чи висновків. Тільки сам звіт.
+        6. Пиши у діловому, але легкому, живому стилі, так, як це робить реальна людина в робочому чаті. Не вигадуй нових фактів, використовуй ЛИШЕ те, що є в нотатках.
+        7. Не додавай ніяких вступів ("Ось ваш звіт") або висновків ("Гарних вихідних"). Тільки сам звіт.
         """
 
         available_models = []
@@ -183,7 +166,7 @@ async def generate_report(message: types.Message):
                 available_models.append(m.name)
         
         if not available_models:
-            await status_msg.edit_text("❌ Твій API-ключ не має доступу до жодної моделі.")
+            await status_msg.edit_text("❌ Твій API-ключ не має доступу до жодної моделі. Перевір налаштування в Google AI Studio.")
             return
             
         model = genai.GenerativeModel(available_models[0])
