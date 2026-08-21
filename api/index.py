@@ -1,21 +1,36 @@
 import os
 import json
+import html
+import uuid
 import logging
 from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
+
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import CommandStart, Command
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 import gspread
+from gspread.exceptions import CellNotFound
 from google.oauth2.service_account import Credentials
 import google.generativeai as genai
 
 logging.basicConfig(level=logging.INFO)
 
-# Змінні оточення Vercel
+# --- Змінні оточення Vercel ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SPREADSHEET_URL = os.getenv("SPREADSHEET_URL")
 GOOGLE_CREDS_JSON = os.getenv("GOOGLE_CREDS_JSON")
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET")  # опційно, але дуже бажано
+ALLOWED_USER_IDS = {
+    int(x) for x in os.getenv("ALLOWED_USER_IDS", "").replace(" ", "").split(",") if x
+}
+
+TZ = ZoneInfo(os.getenv("TZ_NAME", "Europe/Kyiv"))
+DATE_FMT = "%d.%m.%Y %H:%M"
+
+# Порядок колонок у таблиці: Дата | Текст | ID
+COL_DATE, COL_TEXT, COL_ID = 1, 2, 3
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
@@ -24,117 +39,205 @@ app = FastAPI()
 if GEMINI_API_KEY:
     genai.configure(api_key=GEMINI_API_KEY)
 
-def get_sheet():
-    scopes = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
-    creds_dict = json.loads(GOOGLE_CREDS_JSON)
-    creds = Credentials.from_service_account_info(creds_dict, scopes=scopes)
-    client = gspread.authorize(creds)
-    return client.open_by_url(SPREADSHEET_URL).sheet1
+_sheet_cache = None
 
-# Трохи оновили стартове повідомлення, щоб Юля знала про нову команду
+
+def get_sheet():
+    """Кешуємо клієнт у межах теплого інстансу — менше зайвих авторизацій."""
+    global _sheet_cache
+    if _sheet_cache is None:
+        scopes = [
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive",
+        ]
+        creds = Credentials.from_service_account_info(
+            json.loads(GOOGLE_CREDS_JSON), scopes=scopes
+        )
+        client = gspread.authorize(creds)
+        _sheet_cache = client.open_by_url(SPREADSHEET_URL).sheet1
+    return _sheet_cache
+
+
+def now_local() -> datetime:
+    return datetime.now(TZ)
+
+
+def start_of_week() -> datetime:
+    now = now_local()
+    monday = now - timedelta(days=now.weekday())
+    return monday.replace(hour=0, minute=0, second=0, microsecond=0)
+
+
+def parse_note_date(date_str: str):
+    """Парсимо дату з таблиці і робимо її timezone-aware."""
+    try:
+        return datetime.strptime(date_str.strip(), DATE_FMT).replace(tzinfo=TZ)
+    except (ValueError, AttributeError):
+        return None
+
+
+def delete_sheet_row(sheet, row_index: int):
+    """gspread 6.x прибрав delete_row(); лишився тільки delete_rows()."""
+    if hasattr(sheet, "delete_rows"):
+        sheet.delete_rows(row_index)
+    else:
+        sheet.delete_row(row_index)
+
+
+def is_allowed(user_id: int) -> bool:
+    return not ALLOWED_USER_IDS or user_id in ALLOWED_USER_IDS
+
+
+# --- /start ---
 @dp.message(CommandStart())
 async def cmd_start(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
     await message.answer(
         "Привіт, найкраща булочка! 🥐\n\n"
         "Що я вмію:\n"
         "💬 Просто пиши мені нотатки — я їх збережу.\n"
         "📋 <b>/list</b> — подивитися або видалити записи за цей тиждень.\n"
         "📊 <b>/report</b> — зібрати гарний звіт у п'ятницю.",
-        parse_mode="HTML"
+        parse_mode="HTML",
     )
 
-# --- НОВИЙ БЛОК: КОМАНДА /list ---
+
+# --- /list ---
 @dp.message(Command("list"))
 async def cmd_list(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
+
     status_msg = await message.answer("⏳ Дістаю твої записи з таблиці...")
     try:
         sheet = get_sheet()
-        records = sheet.get_all_records()
-        
-        if not records:
-            await status_msg.edit_text("🤷‍♀️ Таблиця порожня, записів немає.")
-            return
+        rows = sheet.get_all_values()[1:]  # без заголовка
+        week_start = start_of_week()
 
-        now = datetime.now()
-        start_of_week = now - timedelta(days=now.weekday())
-        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
-
-        found = False
-        for row in records:
-            date_str = str(row.get("Дата", ""))
-            text = str(row.get("Текст", ""))
-            try:
-                note_date = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
-                if note_date >= start_of_week:
-                    found = True
-                    # Робимо інлайн-кнопку видалення
-                    kb = types.InlineKeyboardMarkup(inline_keyboard=[
-                        [types.InlineKeyboardButton(text="❌ Видалити", callback_data=f"del_{date_str}")]
-                    ])
-                    await message.answer(f"📅 <b>{date_str}</b>\n{text}", reply_markup=kb, parse_mode="HTML")
-            except ValueError:
-                continue
+        found = []
+        for row in rows:
+            date_str = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
+            text = row[COL_TEXT - 1] if len(row) >= COL_TEXT else ""
+            note_id = row[COL_ID - 1] if len(row) >= COL_ID else ""
+            note_date = parse_note_date(date_str)
+            if note_date and note_date >= week_start:
+                found.append((date_str, text, note_id))
 
         if not found:
             await status_msg.edit_text("🤷‍♀️ За цей тиждень ти ще нічого не записувала.")
-        else:
-            await status_msg.delete() # Видаляємо статус-повідомлення
-            
-    except Exception as e:
-        logging.error(e)
-        await status_msg.edit_text("❌ Помилка при пошуку. Скажи Дімі перевірити логи.")
-
-# --- НОВИЙ БЛОК: ОБРОБКА КНОПКИ "ВИДАЛИТИ" ---
-@dp.callback_query(F.data.startswith("del_"))
-async def process_delete(callback: types.CallbackQuery):
-    target_date = callback.data.replace("del_", "") # Дістаємо дату з кнопки
-    try:
-        sheet = get_sheet()
-        
-        # Використовуємо вбудований метод пошуку gspread (працює миттєво)
-        cell = sheet.find(target_date)
-        
-        if cell:
-            sheet.delete_row(cell.row)
-            # Оновлюємо текст повідомлення, щоб кнопку більше не можна було натиснути
-            await callback.message.edit_text(f"🗑 <i>Цей запис було видалено.</i>", parse_mode="HTML")
-            await callback.answer("Успішно видалено!", show_alert=False)
-        else:
-            await callback.answer("Запис не знайдено. Можливо, він вже видалений.", show_alert=True)
-            
-    except Exception as e:
-        logging.error(f"Помилка видалення: {e}")
-        await callback.answer("❌ Помилка видалення. Перевір логи Vercel.", show_alert=True)
-
-# --- БЛОК ГЕНЕРАЦІЇ ЗВІТУ (З НОВИМ ЖИВИМ ПРОМПТОМ) ---
-@dp.message(Command("report"))
-async def generate_report(message: types.Message):
-    status_msg = await message.answer("⏳ Збираю записи та віддаю нейромережі на причісування...")
-    try:
-        sheet = get_sheet()
-        records = sheet.get_all_records()
-        
-        if not records:
-            await status_msg.edit_text("🤷‍♀️ За цей тиждень поки немає жодного запису.")
             return
 
-        now = datetime.now()
-        start_of_week = now - timedelta(days=now.weekday())
-        start_of_week = start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
+        await status_msg.delete()
+
+        # Telegram не любить, коли ллєш десятки повідомлень поспіль
+        for date_str, text, note_id in found[-30:]:
+            key = note_id or date_str  # старі записи без ID шукаємо по даті
+            kb = types.InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        types.InlineKeyboardButton(
+                            text="❌ Видалити", callback_data=f"del_{key}"
+                        )
+                    ]
+                ]
+            )
+            await message.answer(
+                f"📅 <b>{html.escape(date_str)}</b>\n{html.escape(text)}",
+                reply_markup=kb,
+                parse_mode="HTML",
+            )
+
+    except Exception:
+        logging.exception("Помилка /list")
+        await message.answer("❌ Помилка при пошуку. Скажи Дімі перевірити логи.")
+
+
+# --- Кнопка "Видалити" ---
+@dp.callback_query(F.data.startswith("del_"))
+async def process_delete(callback: types.CallbackQuery):
+    if not is_allowed(callback.from_user.id):
+        await callback.answer()
+        return
+
+    key = callback.data.replace("del_", "", 1)
+    try:
+        sheet = get_sheet()
+
+        # Шукаємо спочатку по ID (колонка 3), потім по даті (колонка 1).
+        # in_column обов'язковий: інакше find() зачепить збіг усередині тексту нотатки.
+        cell = None
+        for column in (COL_ID, COL_DATE):
+            try:
+                cell = sheet.find(key, in_column=column)
+            except CellNotFound:
+                cell = None
+            if cell:
+                break
+
+        if cell is None:
+            await callback.answer(
+                "Запис не знайдено. Можливо, він вже видалений.", show_alert=True
+            )
+            return
+
+        delete_sheet_row(sheet, cell.row)
+        await callback.message.edit_text(
+            "🗑 <i>Цей запис було видалено.</i>", parse_mode="HTML"
+        )
+        await callback.answer("Успішно видалено!")
+
+    except Exception as e:
+        logging.exception("Помилка видалення")
+        await callback.answer(f"❌ Помилка: {type(e).__name__}", show_alert=True)
+
+
+# --- /report ---
+PREFERRED_MODELS = (
+    "gemini-2.0-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
+)
+
+
+def pick_model_name() -> str | None:
+    available = [
+        m.name
+        for m in genai.list_models()
+        if "generateContent" in m.supported_generation_methods
+    ]
+    if not available:
+        return None
+    for preferred in PREFERRED_MODELS:
+        for name in available:
+            if preferred in name:
+                return name
+    return available[0]
+
+
+@dp.message(Command("report"))
+async def generate_report(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
+
+    status_msg = await message.answer(
+        "⏳ Збираю записи та віддаю нейромережі на причісування..."
+    )
+    try:
+        sheet = get_sheet()
+        rows = sheet.get_all_values()[1:]
+        week_start = start_of_week()
 
         weekly_notes = []
-        for row in records:
-            date_str = str(row.get("Дата", ""))
-            text = str(row.get("Текст", ""))
-            try:
-                note_date = datetime.strptime(date_str, "%d.%m.%Y %H:%M")
-                if note_date >= start_of_week:
-                    weekly_notes.append(text)
-            except ValueError:
-                continue
+        for row in rows:
+            date_str = row[COL_DATE - 1] if len(row) >= COL_DATE else ""
+            text = row[COL_TEXT - 1] if len(row) >= COL_TEXT else ""
+            note_date = parse_note_date(date_str)
+            if note_date and note_date >= week_start and text.strip():
+                weekly_notes.append(text.strip())
 
         if not weekly_notes:
-            await status_msg.edit_text("🤷‍♀️ На цьому тижні записів не знайдено (старі записи проігноровано).")
+            await status_msg.edit_text("🤷‍♀️ За цей тиждень поки немає жодного запису.")
             return
 
         raw_text = "\n- ".join(weekly_notes)
@@ -142,10 +245,10 @@ async def generate_report(message: types.Message):
         prompt = f"""
         Ти — персональний помічник. Твоє завдання — написати звіт про роботу моделей за тиждень для начальниці Ірини.
         Ось сирі нотатки, які менеджерка накидала за тиждень:
-        
+
         {raw_text}
 
-        Сформуй з них гарний, структурований звіт українською мовою. 
+        Сформуй з них гарний, структурований звіт українською мовою.
         Жорсткі правила форматування:
         1. Звіт має починатися рівно з фрази "По цьому тижню" (без зірочок і жирного шрифту).
         2. Далі обов'язково порожній рядок.
@@ -156,38 +259,59 @@ async def generate_report(message: types.Message):
         7. Не додавай ніяких вступів ("Ось ваш звіт") або висновків ("Гарних вихідних"). Тільки сам звіт.
         """
 
-        available_models = []
-        for m in genai.list_models():
-            if 'generateContent' in m.supported_generation_methods:
-                available_models.append(m.name)
-        
-        if not available_models:
-            await status_msg.edit_text("❌ Твій API-ключ не має доступу до жодної моделі. Перевір налаштування в Google AI Studio.")
+        model_name = pick_model_name()
+        if not model_name:
+            await status_msg.edit_text(
+                "❌ Твій API-ключ не має доступу до жодної моделі. "
+                "Перевір налаштування в Google AI Studio."
+            )
             return
-            
-        model = genai.GenerativeModel(available_models[0])
+
+        model = genai.GenerativeModel(model_name)
         response = await model.generate_content_async(prompt)
         final_report = response.text.strip()
-            
-        await status_msg.edit_text(final_report)
-    except Exception as e:
-        logging.error(e)
-        await status_msg.edit_text(f"❌ Помилка: {e}")
 
+        # Ліміт Telegram — 4096 символів
+        if len(final_report) <= 4000:
+            await status_msg.edit_text(final_report)
+        else:
+            await status_msg.delete()
+            for i in range(0, len(final_report), 4000):
+                await message.answer(final_report[i : i + 4000])
+
+    except Exception as e:
+        logging.exception("Помилка /report")
+        await status_msg.edit_text(f"❌ Помилка: {type(e).__name__}: {e}")
+
+
+# --- Збереження нотатки ---
 @dp.message(F.text)
 async def save_note(message: types.Message):
+    if not is_allowed(message.from_user.id):
+        return
     try:
         sheet = get_sheet()
-        current_date = datetime.now().strftime("%d.%m.%Y %H:%M")
-        sheet.append_row([current_date, message.text.strip()])
+        current_date = now_local().strftime(DATE_FMT)
+        note_id = uuid.uuid4().hex[:8]
+        sheet.append_row(
+            [current_date, message.text.strip(), note_id],
+            value_input_option="USER_ENTERED",
+        )
         await message.reply("✅ Записав!")
-    except Exception as e:
-        logging.error(e)
+    except Exception:
+        logging.exception("Помилка збереження")
         await message.reply("❌ Не зміг зберегти запис.")
 
+
+# --- Webhook ---
 @app.post("/api/webhook")
 async def webhook_handler(request: Request):
+    if WEBHOOK_SECRET:
+        header = request.headers.get("X-Telegram-Bot-Api-Secret-Token")
+        if header != WEBHOOK_SECRET:
+            raise HTTPException(status_code=403, detail="forbidden")
+
     update_data = await request.json()
-    update = types.Update(**update_data)
+    update = types.Update.model_validate(update_data, context={"bot": bot})
     await dp.feed_update(bot, update)
     return {"status": "ok"}
